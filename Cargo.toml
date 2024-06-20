@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 sha2 = "0.10"
+num_cpus = "1.13"
 hex = "0.4"
