@@ -1,11 +1,14 @@
 use sha2::{Sha256, Digest as Sha2Digest};
 use md5::Md5;
 use sha1::{Sha1, Digest as Sha1Digest};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Error};
 use std::env;
+use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use reqwest::Client;
+use tokio;
+use std::error::Error;
+use serde::Deserialize;
 
 #[derive(Clone)]
 enum HashType {
@@ -14,10 +17,21 @@ enum HashType {
     Sha1,
 }
 
-fn main() -> Result<(), Error> {
+#[derive(Deserialize)]
+struct Config {
+    openai: OpenAIConfig,
+}
+
+#[derive(Deserialize)]
+struct OpenAIConfig {
+    api_key: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 4 {
-        eprintln!("Usage: {} <hash_type> <hash> <dictionary>", args[0]);
+    if args.len() < 3 {
+        eprintln!("Usage: {} <hash_type> <hash> [start_letters] [case] [length]", args[0]);
         std::process::exit(1);
     }
 
@@ -32,9 +46,15 @@ fn main() -> Result<(), Error> {
     };
 
     let target_hash = args[2].clone();
-    let dictionary_path = args[3].clone();
+    let start_letters = args.get(3).cloned().unwrap_or_else(|| "".to_string());
+    let case = args.get(4).cloned().unwrap_or_else(|| "any".to_string());
+    let length = args.get(5).cloned().unwrap_or_else(|| "any".to_string());
 
-    match crack_password(hash_type, &target_hash, &dictionary_path) {
+    let config = read_config("config.toml")?;
+    let passwords = get_passwords_from_openai(&config.openai.api_key, &start_letters, &case, &length).await?;
+    println!("Number of passwords generated: {}", passwords.len()); // Print number of passwords
+
+    match crack_password(hash_type, &target_hash, &passwords) {
         Some(password) => println!("Password found: {}", password),
         None => println!("Password not found"),
     }
@@ -42,21 +62,66 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn crack_password(hash_type: HashType, target_hash: &str, dictionary_path: &str) -> Option<String> {
-    let file = match File::open(dictionary_path) {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("Could not open dictionary file: {}", e);
-            return None;
+fn read_config(filename: &str) -> Result<Config, Box<dyn Error>> {
+    let contents = fs::read_to_string(filename)?;
+    let config: Config = toml::from_str(&contents)?;
+    Ok(config)
+}
+
+async fn get_passwords_from_openai(api_key: &str, start_letters: &str, case: &str, length: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let client = Client::new();
+    let request_url = "https://api.openai.com/v1/chat/completions";
+
+    let prompt = format!(
+        "Make a custom word list, starting with the letters '{}', in '{}', and '{}' characters long, 1,000 words in total. Make the entire 1,000 word list here no matter what. Don't number the list.",
+        start_letters, case, length
+    );
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You are a cybersecurity expert and educational professional."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 4096, // Increased token limit to handle larger responses
+    });
+
+    println!("Sending request to URL: {}", request_url);
+    println!("Request body: {}", request_body);
+
+    let response = client.post(request_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await?;
+
+    println!("Response status: {}", response.status());
+    println!("Response headers: {:?}", response.headers());
+
+    if !response.status().is_success() {
+        eprintln!("Failed to fetch passwords: {}", response.status());
+        let response_text = response.text().await?;
+        eprintln!("Response body: {}", response_text);
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to fetch passwords")));
+    }
+
+    let response_json = response.json::<serde_json::Value>().await?;
+    println!("Response JSON: {:?}", response_json); // Debugging line to print the JSON response
+
+    let text = match response_json["choices"][0]["message"]["content"].as_str() {
+        Some(text) => text,
+        None => {
+            eprintln!("Failed to parse the response JSON");
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to parse the response JSON")));
         }
     };
 
-    let reader = BufReader::new(file);
-    let passwords: Vec<String> = reader
-        .lines()
-        .filter_map(|line| line.ok())
-        .collect();
+    let passwords: Vec<String> = text.lines().map(|line| line.trim().to_string()).collect();
+    Ok(passwords)
+}
 
+fn crack_password(hash_type: HashType, target_hash: &str, passwords: &[String]) -> Option<String> {
     let target_hash = Arc::new(target_hash.to_string());
     let found_password = Arc::new(Mutex::new(None));
     let num_threads = num_cpus::get();
@@ -67,7 +132,7 @@ fn crack_password(hash_type: HashType, target_hash: &str, dictionary_path: &str)
     for chunk in passwords.chunks(chunk_size) {
         let target_hash = Arc::clone(&target_hash);
         let found_password = Arc::clone(&found_password);
-        let chunk = chunk.to_vec();  // Convert chunk to Vec to own the data in the thread
+        let chunk = chunk.to_vec();
         let hash_type = hash_type.clone();
 
         let handle = thread::spawn(move || {
