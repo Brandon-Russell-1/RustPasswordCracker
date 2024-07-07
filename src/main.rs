@@ -30,8 +30,8 @@ struct OpenAIConfig {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <hash_type> <hash> [start_letters] [case] [length]", args[0]);
+    if args.len() < 6 {
+        eprintln!("Usage: {} <hash_type> <hash> <start_letters> <case> <length> <total_words>", args[0]);
         std::process::exit(1);
     }
 
@@ -46,12 +46,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let target_hash = args[2].clone();
-    let start_letters = args.get(3).cloned().unwrap_or_else(|| "".to_string());
-    let case = args.get(4).cloned().unwrap_or_else(|| "any".to_string());
-    let length = args.get(5).cloned().unwrap_or_else(|| "any".to_string());
+    let start_letters = &args[3];
+    let case = &args[4];
+    let length = &args[5];
+    let total_words: usize = args[6].parse().unwrap_or(1000);
 
     let config = read_config("config.toml")?;
-    let passwords = get_passwords_from_openai(&config.openai.api_key, &start_letters, &case, &length).await?;
+    let passwords = get_passwords_from_openai(&config.openai.api_key, start_letters, case, length, total_words).await?;
     println!("Number of passwords generated: {}", passwords.len()); // Print number of passwords
 
     match crack_password(hash_type, &target_hash, &passwords) {
@@ -68,13 +69,13 @@ fn read_config(filename: &str) -> Result<Config, Box<dyn Error>> {
     Ok(config)
 }
 
-async fn get_passwords_from_openai(api_key: &str, start_letters: &str, case: &str, length: &str) -> Result<Vec<String>, Box<dyn Error>> {
+async fn get_passwords_from_openai(api_key: &str, start_letters: &str, case: &str, length: &str, total_words: usize) -> Result<Vec<String>, Box<dyn Error>> {
     let client = Client::new();
     let request_url = "https://api.openai.com/v1/chat/completions";
 
     let prompt = format!(
-        "Make a custom word list, starting with the letters '{}', in '{}', and '{}' characters long, 1,000 words in total. Make the entire 1,000 word list here no matter what. Don't number the list.",
-        start_letters, case, length
+        "Make a custom word list, starting with the letters '{}', in '{}', and '{}' characters long, {} words in total. Make the entire {} word list here no matter what. Don't number the list.",
+        start_letters, case, length, total_words, total_words
     );
 
     let request_body = serde_json::json!({
